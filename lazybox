@@ -1,0 +1,498 @@
+#!/bin/bash
+
+########################################################################################################################
+# lazybox - Minimal container environment using btrfs snapshots
+# Version: 1.0.0
+# A lightweight container system leveraging btrfs snapshots and overlay filesystems
+########################################################################################################################
+
+# Set strict execution options for robust error handling
+set -euo pipefail
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Configuration
+#-----------------------------------------------------------------------------------------------------------------------
+LAZYBOX_VERSION="1.0.0"                      # Version number
+LAZYBOX_PREFIX="lazybox-"                    # Prefix for container naming
+LAZYBOX_DIR="${HOME}/.local/share/lazybox"   # Main storage directory
+SNAPSHOTS_DIR="${LAZYBOX_DIR}/snapshots"     # Read-only btrfs snapshots
+UPPER_DIR="${LAZYBOX_DIR}/upper"             # Writable overlay layer
+WORK_DIR="${LAZYBOX_DIR}/work"               # OverlayFS working directory
+MERGED_DIR="${LAZYBOX_DIR}/merged"           # Combined view directory
+SESSION_PREFIX="${LAZYBOX_PREFIX}session-"   # Prefix for session names
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Logging Functions
+#-----------------------------------------------------------------------------------------------------------------------
+print_info() { echo "$*"; }
+print_highlight() { echo -e "\033[1m$*\033[0m"; }
+print_warning() { echo -e "\033[1;38;5;208m$*\033[0m" >&2; }
+print_error() { echo -e "\033[1;31m$*\033[0m" >&2; }
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Display Help Information
+#-----------------------------------------------------------------------------------------------------------------------
+show_help() {
+    cat << EOF
+
+$(basename "$0") version $LAZYBOX_VERSION - Minimal container environment management tool using btrfs snapshots
+A lightweight tool for building isolated development environments using btrfs snapshots as the base and OverlayFS for 
+persistent user changes.
+Note that rootfs(/) must be btrfs for snapshot functionality and podman, btrfs, sudo, slirp4netns commands are needed.
+
+Usage: $(basename "$0") [COMMAND] [OPTIONS]
+
+Commands:
+  create <name>    Create a new container from the current system state
+  enter <name>     Start a new session in the specified container
+  list             Display all available containers and session counts
+  delete <name>    Remove a container and all associated data
+  update <name>    Refresh the base snapshot while preserving user data
+  help             Show this help message
+
+Features:
+  * Multiple concurrent sessions per container
+  * User identity preserved inside containers
+  * Full system command support (proper /proc, /sys mounts)
+  * Persistent user home directory access
+  * Network connectivity via slirp4netns
+  * Basic X11 GUI application support
+
+Examples:
+  $(basename "$0") create myproject      # Create a new container
+  $(basename "$0") enter myproject       # Start working in the container
+  $(basename "$0") list                  # View all containers
+  $(basename "$0") update myproject      # Update container base system
+  $(basename "$0") delete myproject      # Remove container completely
+
+Container folder: ${LAZYBOX_DIR}
+EOF
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Dependency Validation
+#-----------------------------------------------------------------------------------------------------------------------
+check_dependencies() {
+    local missing_deps=()
+    for cmd in "$@"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_error "Required tools not found: ${missing_deps[*]}"
+        return 1
+    fi
+
+    return 0
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Filesystem Validation
+#-----------------------------------------------------------------------------------------------------------------------
+check_btrfs_root() {
+    if ! sudo btrfs filesystem show / &> /dev/null; then
+        print_error "Rootfs(/) must be btrfs for snapshot functionality"
+        return 1
+    fi
+    return 0
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Session Management
+#-----------------------------------------------------------------------------------------------------------------------
+stop_all_sessions() {
+    local name="$1"  # Container name
+    
+    local sessions_to_stop=$(podman ps -a --format "{{.Names}}" | grep "^${SESSION_PREFIX}${name}-" || true)
+    
+    if [[ -n "$sessions_to_stop" ]]; then
+        echo "$sessions_to_stop" | while read -r session; do
+            print_info "Stopping: ${session} of container: ${name}"
+            podman stop "$session" 2>/dev/null || true
+            podman rm -f "$session" 2>/dev/null || true
+        done
+    else
+        print_info "No active sessions of ${name} found"
+    fi
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Directory Initialization
+#-----------------------------------------------------------------------------------------------------------------------
+prepare_dirs() {
+    # Ensure all required directories exist
+    mkdir -p "${LAZYBOX_DIR}" "${SNAPSHOTS_DIR}" "${UPPER_DIR}" "${WORK_DIR}" "${MERGED_DIR}"
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Overlay Filesystem Management
+#-----------------------------------------------------------------------------------------------------------------------
+mount_overlay() {
+    local name="$1"
+    local merged_dir="${MERGED_DIR}/${name}"
+    
+    # Verify mount dependencies
+    if ! check_dependencies "sudo"; then
+        return 1
+    fi
+
+    # Skip if already mounted
+    if mountpoint -q "${merged_dir}" 2>/dev/null; then
+        print_info "Overlay already mounted for: ${name}"
+        return 0
+    fi
+    
+    # Prepare mount point
+    mkdir -p "${merged_dir}"
+    
+    # Mount overlay filesystem
+    if sudo mount -t overlay overlay \
+        -o "lowerdir=${SNAPSHOTS_DIR}/${name},upperdir=${UPPER_DIR}/${name},workdir=${WORK_DIR}/${name}" \
+        "${merged_dir}"; then
+        print_highlight "Overlay mounted for: ${name}"
+        return 0
+    else
+        print_error "Failed to mount overlay for: ${name}"
+        return 1
+    fi
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Overlay Unmount (Conditional)
+#-----------------------------------------------------------------------------------------------------------------------
+umount_overlay_if_unused() {
+    local name="$1"
+    local merged_dir="${MERGED_DIR}/${name}"
+    
+    if ! check_dependencies "sudo"; then
+        return 1
+    fi
+    
+    # Check for active sessions
+    local running_sessions=$(podman ps -a --format "{{.Names}}" | grep "^${SESSION_PREFIX}${name}-" || true)
+    
+    if [[ -n "$running_sessions" ]]; then
+        print_info "Active sessions detected, keeping overlay mounted"
+        return 0
+    fi
+    
+    # Unmount if no longer needed
+    if mountpoint -q "${merged_dir}" 2>/dev/null; then
+        if sudo umount -l "${merged_dir}" 2>/dev/null; then
+            print_highlight "No active sessions of ${name}, overlay unmounted"
+            rmdir "${merged_dir}" 2>/dev/null || true
+            return 0
+        else
+            print_warning "Could not unmount overlay"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Snapshot Creation
+#-----------------------------------------------------------------------------------------------------------------------
+create_snapshot() {
+    local name="$1"
+    local snapshot_dir="${SNAPSHOTS_DIR}/${name}"
+    
+    if ! check_dependencies "btrfs" "sudo"; then
+        return 1
+    fi
+    
+    if ! check_btrfs_root; then
+        return 1
+    fi
+
+    # Remove existing snapshot if present
+    if [[ -d "${snapshot_dir}" ]]; then
+        print_error "Removing existing snapshot..."
+        sudo btrfs subvolume delete "${snapshot_dir}" 2>/dev/null || true
+        rm -rf "${snapshot_dir}"
+    fi
+
+    print_info "Creating system snapshot..."
+    # Create read-only snapshot of current system
+    sudo btrfs subvolume snapshot -r / "${snapshot_dir}"
+    # Allow modification for overlay use
+    sudo btrfs property set "${snapshot_dir}" ro false 2>/dev/null || true
+
+    print_info "Snapshot created: ${snapshot_dir}"
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Container Creation
+#-----------------------------------------------------------------------------------------------------------------------
+create_container() {
+    local name="$1"
+
+    echo "Creating container: ${name}"
+
+    if ! check_dependencies "btrfs" "sudo"; then
+        return 1
+    fi
+    
+    if ! check_btrfs_root; then
+        return 1
+    fi
+
+    print_info "Creating directories: ${UPPER_DIR}/${name} ${WORK_DIR}/${name}..."
+    prepare_dirs
+    mkdir -p "${UPPER_DIR}/${name}" "${WORK_DIR}/${name}"
+
+    print_info "Creating system snapshot..."
+    create_snapshot "${name}"
+    
+    print_highlight "Container created: ${name}"
+    echo "Access container with: $(basename "$0") enter ${name}"
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Container Session
+#-----------------------------------------------------------------------------------------------------------------------
+enter_container() {
+    local name="$1"
+    
+    # Generate unique session identifier
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local random=$(head /dev/urandom | tr -dc 'a-f0-9' | head -c 4)
+    local session_id="${name}-${timestamp}-${random}"
+    local session_name="${SESSION_PREFIX}${session_id}"
+
+    echo "Starting session in container: ${name}, session identifier: ${session_id}"
+
+    if [[ ! -d "${SNAPSHOTS_DIR}/${name}" ]]; then
+        print_error "Container not found: ${name}, mannully creation : $(basename "$0") create ${name}"
+        return 1
+    fi
+
+    if ! check_dependencies "podman" "sudo" "slirp4netns"; then
+        return 1
+    fi
+
+    # Ensure overlay filesystem is mounted
+    if ! mountpoint -q "${MERGED_DIR}/${name}" 2>/dev/null; then
+        print_info "Setting up overlay filesystem..."
+        mount_overlay "${name}" || return 1
+    else
+        print_info "Overlay filesystem ready"
+    fi
+
+    print_info "Initializing container session..."
+
+    # Capture current environment for container
+    TEMP_ENV_FILE=$(mktemp)
+    env -0 | while IFS='=' read -r -d '' key value; do
+        printf '%s=%s\n' "$key" "${value//$'\n'/' '}" >> "$TEMP_ENV_FILE"
+    done
+
+    # Launch container with full system access
+    exec sudo podman run --rm -it \
+        --name "${session_name}" \
+        --hostname "${session_id}" \
+        --network=slirp4netns \
+        --security-opt label=disable \
+        --cap-add=SYS_ADMIN \
+        --cap-add=NET_ADMIN \
+        --tmpfs /tmp \
+        --tmpfs /run \
+        --tmpfs /var/tmp \
+        -v "/proc:/proc" \
+        -v "/sys:/sys:rslave" \
+        -v "/dev:/dev:rslave" \
+        -v "/run/user/$(id -u):/run/user/$(id -u):rslave" \
+        -v "${HOME}:${HOME}:rw" \
+        -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
+        --volume /dev/dri:/dev/dri:ro \
+        --env-file "$TEMP_ENV_FILE" \
+        --rootfs "${MERGED_DIR}/${name}:O" \
+        /bin/bash -c "
+            chown $(id -u):$(id -g) /run
+            mkdir -p -m 1777 /run/lock
+            exec sudo -E -u michael sh -c 'cd \$HOME && exec /bin/bash -l'
+        "
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Container Listing
+#-----------------------------------------------------------------------------------------------------------------------
+list_containers() {
+    local containers=()
+    if [[ -d "${SNAPSHOTS_DIR}" ]]; then
+        for snap in "${SNAPSHOTS_DIR}"/*/; do
+            [[ -d "$snap" ]] && containers+=("$(basename "$snap")")
+        done
+    fi
+
+    if [[ ${#containers[@]} -eq 0 ]]; then
+        echo "No containers available. Create a container: $(basename "$0") create <name>"
+        return
+    fi
+
+    # Column widths: NAME(32), STATUS(16), ACTIVE SESSIONS(15)
+    printf "%-32s %-16s %-15s\n" "NAME" "STATUS" "ACTIVE SESSIONS"
+    printf "%-32s %-16s %-15s\n" "--------------------------------" "----------------" "---------------"
+    
+    for name in "${containers[@]}"; do
+        local mounted="unmounted"
+        if mountpoint -q "${MERGED_DIR}/${name}" 2>/dev/null; then
+            mounted="(mounted)"
+        fi
+
+        local session_count=0
+        if podman ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^${SESSION_PREFIX}${name}-"; then
+            session_count=$(podman ps -a --format "{{.Names}}" 2>/dev/null | grep -c "^${SESSION_PREFIX}${name}-")
+        fi
+
+        printf "%-32s %-16s %-15s\n" "${name}" "${mounted}" "${session_count}"
+    done
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Container Deletion
+#-----------------------------------------------------------------------------------------------------------------------
+delete_container() {
+    local name="$1"
+
+    echo "Removing container: ${name}"
+
+    if [[ ! -d "${SNAPSHOTS_DIR}/${name}" ]]; then
+        print_error "Container not found: ${name}"
+        return 1
+    fi
+
+    if ! check_dependencies "btrfs" "sudo" "podman"; then
+        return 1
+    fi
+
+    echo "Tht following objects will be permanently deleted:"
+    echo "  - Base snapshot: ${SNAPSHOTS_DIR}/${name}"
+    echo "  - User modifications: ${UPPER_DIR}/${name}"
+    echo "  - All container-specific data"
+    echo "  - Any active sessions"
+
+    read -p "Continue with deletion? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Deletion cancelled"
+        return 0
+    fi
+
+    # Terminate all sessions
+    stop_all_sessions "${name}"
+    
+    print_info "Unmounting overlay..."
+    umount_overlay_if_unused "${name}"
+    print_info "Removing snapshot..."
+    sudo btrfs subvolume delete "${SNAPSHOTS_DIR}/${name}" 2>/dev/null || true
+    print_info "Cleaning up container data..."
+    rm -rf "${UPPER_DIR}/${name}" "${WORK_DIR}/${name}" "${MERGED_DIR}/${name}"
+    print_highlight "Container removed: ${name}"
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Container Update
+#-----------------------------------------------------------------------------------------------------------------------
+update_container() {
+    local name="$1"
+
+    echo "Updating container: ${name}"
+
+    if [[ ! -d "${SNAPSHOTS_DIR}/${name}" ]]; then
+        print_error "Container not found: ${name}"
+        return 1
+    fi
+
+    if ! check_dependencies "btrfs" "sudo" "podman"; then
+        return 1
+    fi
+
+    echo "This will refresh the base system snapshot while preserving user data."
+    echo "Container access will be temporarily suspended during the update."
+    echo "  - All active sessions will be terminated"
+    echo "  - User modifications will be preserved"
+
+    read -p "Proceed with update? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Update cancelled"
+        return 0
+    fi
+
+    # Terminate all sessions
+    stop_all_sessions "${name}"
+    
+    umount_overlay_if_unused "${name}"
+    local backup_dir=""
+    if [[ -d "${UPPER_DIR}/${name}" ]]; then
+        backup_dir="${LAZYBOX_DIR}/backup_${name}_$(date +%Y%m%d_%H%M%S)"
+        print_info "Creating backup of user data: ${backup_dir}"
+        cp -a "${UPPER_DIR}/${name}" "${backup_dir}" 2>/dev/null || true
+    fi
+    print_info "Refreshing base snapshot..."
+    sudo btrfs subvolume delete "${SNAPSHOTS_DIR}/${name}" 2>/dev/null || true
+    create_snapshot "${name}"
+    print_highlight "Container updated: ${name}"
+    if [[ -n "$backup_dir" ]]; then
+        echo "Backup available at: ${backup_dir}"
+    fi
+    echo "Note: Start a new session to use the updated base system with: $(basename "$0") enter ${name}"
+}
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Command Router
+#-----------------------------------------------------------------------------------------------------------------------
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        create)
+            if [[ $# -lt 2 ]]; then
+                print_error "Container name required"
+                echo "Usage: $(basename "$0") create <name>"
+                return 1
+            fi
+            create_container "$2"
+            ;;
+        enter)
+            if [[ $# -lt 2 ]]; then
+                print_error "Container name required"
+                echo "Usage: $(basename "$0") enter <name>"
+                return 1
+            fi
+            enter_container "$2"
+            ;;
+        list)
+            list_containers
+            ;;
+        delete)
+            if [[ $# -lt 2 ]]; then
+                print_error "Container name required"
+                echo "Usage: $(basename "$0") delete <name>"
+                return 1
+            fi
+            delete_container "$2"
+            ;;
+        update)
+            if [[ $# -lt 2 ]]; then
+                print_error "Container name required"
+                echo "Usage: $(basename "$0") update <name>"
+                return 1
+            fi
+            update_container "$2"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            show_help
+            return 1
+            ;;
+    esac
+}
+
+# Execute command router with all arguments
+main "$@"
